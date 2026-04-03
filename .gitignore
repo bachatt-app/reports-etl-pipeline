@@ -2,3 +2,9 @@
 .env
 __pycache__
 venv
+service-account.json
+/output
+last_sync.txt
+token.json
+credentials.json
+refresh_token.json

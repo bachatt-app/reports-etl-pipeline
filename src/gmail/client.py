@@ -4,7 +4,7 @@ Async Gmail client — Singleton with robust token lifecycle management.
 Auth modes
 ----------
 USE_SECRET_MANAGER=false (default / local dev)
-    Credentials loaded from credentials.json + token.json on disk.
+    Credentials loaded from service-account.json + token.json on disk.
     OAuth consent flow launched in browser on first run.
 
 USE_SECRET_MANAGER=true (production / GCP)
@@ -29,6 +29,7 @@ import functools
 import json
 import logging
 import os
+import ssl
 import threading
 from email.mime.text import MIMEText
 from pathlib import Path
@@ -54,10 +55,12 @@ from src.config.settings import (
     GMAIL_CREDENTIALS_SECRET,
     GMAIL_REFRESH_TOKEN_SECRET,
     GMAIL_SCOPES,
+    GMAIL_SERVICE_ACCOUNT_FILE,
     GMAIL_TOKEN_FILE,
     GMAIL_USER,
     GCP_PROJECT_ID,
     USE_SECRET_MANAGER,
+    USE_SERVICE_ACCOUNT,
 )
 from src.logging_context import get_request_id
 
@@ -65,11 +68,21 @@ logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Retry policy — transient network / server errors only (not auth errors)
+# Covers: google-auth transport errors, API HTTP errors, SSL handshake
+# failures, socket/read timeouts, and general connection resets.
 # ---------------------------------------------------------------------------
+_RETRYABLE_ERRORS = (
+    TransportError,   # google-auth transport wrapper
+    HttpError,        # googleapiclient 5xx / rate-limit responses
+    ssl.SSLError,     # TLS record-layer / handshake failures
+    TimeoutError,     # socket.timeout is a subclass of TimeoutError (Py3.3+)
+    ConnectionError,  # ConnectionResetError, BrokenPipeError, etc.
+    OSError,          # catch-all for low-level socket errors not covered above
+)
 _RETRY_POLICY = dict(
-    retry=retry_if_exception_type((TransportError, HttpError)),
-    stop=stop_after_attempt(4),
-    wait=wait_exponential(multiplier=1, min=1, max=16),
+    retry=retry_if_exception_type(_RETRYABLE_ERRORS),
+    stop=stop_after_attempt(5),
+    wait=wait_exponential(multiplier=1, min=2, max=30),
     before_sleep=before_sleep_log(logger, logging.WARNING),
     reraise=True,
 )
@@ -115,8 +128,52 @@ class GmailClient:
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(None, functools.partial(func, *args, **kwargs))
 
+    async def _api_run(self, func, *args, **kwargs):
+        """
+        Run a googleapiclient .execute() call with a fresh httplib2.Http() per
+        call.  httplib2 is NOT thread-safe — sharing one Http instance across
+        concurrent run_in_executor threads causes SSL record-layer failures.
+        Passing http= to execute() overrides the service-level connection so
+        every call gets its own isolated TCP/TLS session.
+        """
+        import httplib2
+        from google_auth_httplib2 import AuthorizedHttp
+        kwargs.setdefault("http", AuthorizedHttp(self._creds, http=httplib2.Http()))
+        return await self._run(func, *args, **kwargs)
+
     def _log(self, level: int, msg: str, *args) -> None:
         logger.log(level, "[req_id=%s] %s", get_request_id(), msg % args if args else msg)
+
+    # ------------------------------------------------------------------
+    # Auth — service account path (local dev, no token expiry)
+    # ------------------------------------------------------------------
+
+    async def _load_creds_from_service_account(self) -> "google.oauth2.service_account.Credentials":
+        """
+        Build delegated service-account credentials that impersonate GMAIL_USER.
+
+        Prerequisites (one-time setup):
+          1. Create a service account in GCP Console and download its JSON key.
+          2. In Google Workspace Admin → Security → API Controls → Domain-wide
+             Delegation, add the service account's client ID with these scopes:
+               https://www.googleapis.com/auth/gmail.modify
+               https://www.googleapis.com/auth/drive.readonly
+          3. Set GMAIL_SERVICE_ACCOUNT_FILE=<path-to-key>.json and
+             GMAIL_USER=<the-gmail-address-to-impersonate> in your .env.
+        """
+        from google.oauth2 import service_account  # lazy import
+
+        self._log(logging.INFO, "Loading service-account credentials from %s (impersonating %s)",
+                  GMAIL_SERVICE_ACCOUNT_FILE, self._user)
+
+        creds = await self._run(
+            service_account.Credentials.from_service_account_file,
+            GMAIL_SERVICE_ACCOUNT_FILE,
+            scopes=GMAIL_SCOPES,
+            subject=self._user,       # domain-wide delegation — act as this user
+        )
+        self._log(logging.INFO, "Service-account credentials loaded successfully.")
+        return creds
 
     # ------------------------------------------------------------------
     # Auth — Secret Manager path (production)
@@ -222,16 +279,21 @@ class GmailClient:
             if self._creds and self._creds.valid:
                 return
 
-            if USE_SECRET_MANAGER:
+            if USE_SERVICE_ACCOUNT:
+                self._creds = await self._load_creds_from_service_account()
+                mode = "service-account"
+            elif USE_SECRET_MANAGER:
                 self._creds = await self._load_creds_from_secret_manager()
+                mode = "secret-manager"
             else:
                 self._creds = await self._load_creds_from_file()
+                mode = "local-file"
 
             # Build (or rebuild) both API services after creds change
             self._service = await self._run(build, "gmail", "v1", credentials=self._creds)
             self._drive_service = await self._run(build, "drive", "v3", credentials=self._creds)
             self._log(logging.INFO, "Gmail + Drive services ready (user=%s, mode=%s).",
-                      self._user, "secret-manager" if USE_SECRET_MANAGER else "local-file")
+                      self._user, mode)
 
     async def _gmail(self):
         await self._ensure_authenticated()
@@ -249,7 +311,7 @@ class GmailClient:
     async def get_messages(self, query: str = "", max_results: int = 10) -> list[dict]:
         """Return message stubs matching a Gmail search query."""
         svc = await self._gmail()
-        result = await self._run(
+        result = await self._api_run(
             svc.users().messages().list(
                 userId=self._user, q=query, maxResults=max_results
             ).execute
@@ -262,7 +324,7 @@ class GmailClient:
     async def get_message(self, message_id: str) -> dict:
         """Fetch a full message payload by ID."""
         svc = await self._gmail()
-        msg = await self._run(
+        msg = await self._api_run(
             svc.users().messages().get(
                 userId=self._user, id=message_id, format="full"
             ).execute
@@ -277,7 +339,7 @@ class GmailClient:
     async def get_attachment(self, message_id: str, attachment_id: str) -> bytes:
         """Download and base64-decode a Gmail attachment."""
         svc = await self._gmail()
-        raw = await self._run(
+        raw = await self._api_run(
             svc.users().messages().attachments().get(
                 userId=self._user, messageId=message_id, id=attachment_id
             ).execute
@@ -293,17 +355,36 @@ class GmailClient:
     @retry(**_RETRY_POLICY)
     async def drive_download(self, file_id: str) -> bytes:
         """Download raw bytes of a Google Drive file."""
+        import httplib2
+        from google_auth_httplib2 import AuthorizedHttp
         svc = await self._drive()
         self._log(logging.INFO, "Downloading Drive file id=%s", file_id)
-        raw: bytes = await self._run(_drive_download_sync, svc, file_id)
+        # MediaIoBaseDownload doesn't accept http= on execute(), so pass a
+        # fresh AuthorizedHttp directly for the same thread-safety reason.
+        http = AuthorizedHttp(self._creds, http=httplib2.Http())
+        raw: bytes = await self._run(_drive_download_sync, svc, file_id, http)
         self._log(logging.INFO, "Drive file id=%s downloaded (%d bytes)", file_id, len(raw))
         return raw
+
+    @retry(**_RETRY_POLICY)
+    async def download_from_url(self, url: str) -> bytes:
+        """
+        Download raw bytes from a pre-signed HTTPS URL (no auth required).
+
+        Used for KFintech scdelivery.kfintech.com links embedded in email bodies.
+        Validates that the response is a ZIP file (PK magic bytes), not an HTML
+        error page.  Raises RuntimeError on failure so the caller can alert.
+        """
+        self._log(logging.INFO, "Downloading from URL: %s", url)
+        data: bytes = await self._run(_download_url_sync, url)
+        self._log(logging.INFO, "Downloaded %d bytes from URL", len(data))
+        return data
 
     @retry(**_RETRY_POLICY)
     async def drive_filename(self, file_id: str) -> str:
         """Fetch the filename metadata of a Drive file."""
         svc = await self._drive()
-        meta = await self._run(
+        meta = await self._api_run(
             svc.files().get(fileId=file_id, fields="name").execute
         )
         name: str = meta.get("name", file_id)
@@ -328,7 +409,7 @@ class GmailClient:
         svc = await self._gmail()
 
         try:
-            await self._run(
+            await self._api_run(
                 svc.users().messages().send(
                     userId=ALERT_EMAIL_FROM, body={"raw": raw_msg}
                 ).execute
@@ -349,16 +430,61 @@ def _header(message: dict, name: str) -> str:
     return ""
 
 
-def _drive_download_sync(svc, file_id: str) -> bytes:
+def _drive_download_sync(svc, file_id: str, http) -> bytes:
     import io as _io
-    request = svc.files().get_media(fileId=file_id)
-    buf = _io.BytesIO()
     from googleapiclient.http import MediaIoBaseDownload
+    request = svc.files().get_media(fileId=file_id)
+    request._http = http  # inject fresh connection — MediaIoBaseDownload uses request._http internally
+    buf = _io.BytesIO()
     downloader = MediaIoBaseDownload(buf, request)
     done = False
     while not done:
         _, done = downloader.next_chunk()
     return buf.getvalue()
+
+
+def _download_url_sync(url: str) -> bytes:
+    """
+    Blocking HTTPS download with browser-like headers.
+
+    KFintech pre-signed URLs are single-use direct downloads — no cookies or
+    session needed.  Validates the response is a ZIP (PK magic bytes) and not
+    an HTML error page before returning bytes.
+    """
+    import urllib.request
+
+    _trusted = ("kfintech.com", "camsonline.com")
+    if not url.startswith("https://") or not any(d in url for d in _trusted):
+        raise ValueError(f"Untrusted download URL: {url!r}")
+
+    req = urllib.request.Request(
+        url,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept": "application/zip,application/octet-stream,*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "Cache-Control": "no-cache",
+        },
+    )
+    with urllib.request.urlopen(req, timeout=60) as resp:
+        if resp.status != 200:
+            raise RuntimeError(f"HTTP {resp.status} from {url}")
+        content_type = resp.headers.get("Content-Type", "")
+        data: bytes = resp.read()
+
+    if "text/html" in content_type:
+        raise RuntimeError(
+            f"Server returned HTML instead of a ZIP file — URL may be expired: {url}"
+        )
+    if len(data) < 4 or data[:2] != b"PK":
+        raise RuntimeError(
+            f"Downloaded file is not a valid ZIP archive (magic bytes mismatch): {url}"
+        )
+    return data
 
 
 def _delete_token_file() -> None:
